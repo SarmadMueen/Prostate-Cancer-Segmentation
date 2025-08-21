@@ -1,0 +1,90 @@
+
+# ==============================================================================
+# File: data_loader.py
+# Description: Handles data loading, augmentation, and generation.
+# ==============================================================================
+
+import tensorflow as tf
+import numpy as np
+import cv2
+import imageio
+import albumentations as A
+from config import COLORMAP, INPUT_SHAPE
+
+def get_training_augmentation():
+    """Defines the augmentation pipeline for the training data."""
+    train_transform = [
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=0.5, border_mode=0),
+        A.OneOf([
+            A.CLAHE(p=1),
+            A.RandomBrightnessContrast(p=1),
+            A.RandomGamma(p=1),
+        ], p=0.9),
+        A.OneOf([
+            A.RandomRotate90(p=1),
+            A.Flip(p=1),
+        ], p=0.5),
+        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+    ]
+    return A.Compose(train_transform)
+
+def get_validation_augmentation():
+    """Defines the augmentation/preprocessing for the validation data."""
+    return A.Compose([
+        A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+    ])
+
+def create_multichannel_mask(mask_img):
+    """Converts a color-coded mask to a one-hot encoded multi-channel mask."""
+    shape = mask_img.shape[:2] + (len(COLORMAP),)
+    encoded_mask = np.zeros(shape, dtype=np.float32)
+    for i, color in COLORMAP.items():
+        encoded_mask[:, :, i] = np.all(mask_img == color, axis=-1)
+    return encoded_mask
+
+class DataGenerator(tf.keras.utils.Sequence):
+    """
+    Custom Keras data generator for loading and augmenting images and masks.
+    """
+    def __init__(self, img_paths, mask_paths, batch_size, augmentation=None, shuffle=True):
+        self.img_paths = img_paths
+        self.mask_paths = mask_paths
+        self.batch_size = batch_size
+        self.augmentation = augmentation
+        self.shuffle = shuffle
+        self.indexes = np.arange(len(self.img_paths))
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.floor(len(self.img_paths) / self.batch_size))
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+    def __getitem__(self, index):
+        batch_indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
+        
+        batch_img_paths = [self.img_paths[i] for i in batch_indexes]
+        batch_mask_paths = [self.mask_paths[i] for i in batch_indexes]
+        
+        X = np.empty((self.batch_size, INPUT_SHAPE[0], INPUT_SHAPE[1], INPUT_SHAPE[2]), dtype=np.float32)
+        Y = np.empty((self.batch_size, INPUT_SHAPE[0], INPUT_SHAPE[1], len(COLORMAP)), dtype=np.float32)
+        
+        for i, (img_path, mask_path) in enumerate(zip(batch_img_paths, batch_mask_paths)):
+            img = cv2.imread(img_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, (INPUT_SHAPE[0], INPUT_SHAPE[1]))
+            
+            mask = imageio.imread(mask_path, pilmode="RGB")
+            mask = cv2.resize(mask, (INPUT_SHAPE[0], INPUT_SHAPE[1]))
+            
+            if self.augmentation:
+                sample = self.augmentation(image=img, mask=mask)
+                img, mask = sample['image'], sample['mask']
+            
+            Y[i,] = create_multichannel_mask(mask)
+            X[i,] = img
+            
+        return X, Y
