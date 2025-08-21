@@ -1,80 +1,142 @@
-
 # ==============================================================================
 # File: model.py
-# Description: Defines the neural network architecture.
+# Description: Defines the novel Sparse U-Net neural network architecture.
 # ==============================================================================
 
 import tensorflow as tf
 from tensorflow.keras.layers import *
-from config import INPUT_SHAPE, NUM_CLASSES
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
-from data_loader import DataGenerator, get_training_augmentation, get_validation_augmentation
-from model import build_attention_unet
-from utils import iou_loss, mean_iou
-from config import *
-
+from tensorflow.keras.regularizers import l2
+from config import INPUT_SHAPE, NUM_CLASSES, CARDINALITY
 
 # --- Custom Model Blocks ---
 
-def conv_block(x, num_filters, kernel_size=(3, 3), strides=(1, 1)):
-    """A standard convolutional block with Batch Norm and ReLU activation."""
-    x = Conv2D(num_filters, kernel_size, strides=strides, padding='same', kernel_initializer='he_normal')(x)
-    x = BatchNormalization()(x)
+def bnrelu(x):
+    """A standard Batch Normalization -> ReLU activation block."""
+    x = BatchNormalization(axis=-1)(x)
     x = Activation('relu')(x)
     return x
 
-def attention_block(F_g, F_l, F_int):
-    """Attention Gate (AG) for segmentation models."""
-    g = Conv2D(F_int, (1, 1), strides=(1, 1), padding='valid')(F_g)
-    g = BatchNormalization()(g)
+def conv_block(x, nb_filter, kernel_size=(3, 3), strides=(1, 1)):
+    """A standard convolutional block."""
+    x = Conv2D(nb_filter, kernel_size=kernel_size, strides=strides, padding='same', kernel_initializer='he_normal')(x)
+    x = bnrelu(x)
+    return x
+
+def add_common_layers(y):
+    """Adds common layers for ResNeXt block."""
+    y = BatchNormalization()(y)
+    y = Activation('relu')(y)
+    return y
+
+def grouped_convolution(y, nb_channels, _strides):
+    """Grouped convolution operation for ResNeXt."""
+    if CARDINALITY == 1:
+        return SeparableConv2D(nb_channels, kernel_size=(3, 3), strides=_strides, padding='same')(y)
     
-    x = Conv2D(F_int, (1, 1), strides=(1, 1), padding='valid')(F_l)
-    x = BatchNormalization()(x)
+    assert not nb_channels % CARDINALITY
+    _d = nb_channels // CARDINALITY
+    groups = []
+    for j in range(CARDINALITY):
+        group = Lambda(lambda z: z[:, :, :, j * _d:j * _d + _d])(y)
+        groups.append(Conv2D(_d, kernel_size=(3, 3), strides=_strides, padding='same')(group))
+    y = concatenate(groups)
+    return y
+
+def squeeze_excite_block(inputs, ratio=8):
+    """Squeeze and Excite block for channel-wise feature recalibration."""
+    init = inputs
+    channel_axis = -1
+    filters = init.shape[channel_axis]
+    se_shape = (1, 1, filters)
+
+    se = GlobalAveragePooling2D()(init)
+    se = Reshape(se_shape)(se)
+    se = Dense(filters // ratio, activation='relu', kernel_initializer='he_normal', use_bias=False)(se)
+    se = Dense(filters, activation='sigmoid', kernel_initializer='he_normal', use_bias=False)(se)
+    x = Multiply()([init, se])
+    return x
+
+def resnext_block(y, nb_channels_in, nb_channels_out, _strides=(1, 1)):
+    """ResNeXt block with squeeze-and-excite."""
+    shortcut = y
     
-    psi = add([g, x])
-    psi = Activation('relu')(psi)
+    y = SeparableConv2D(nb_channels_in, kernel_size=(1, 1), strides=(1, 1), padding='same')(y)
+    y = add_common_layers(y)
     
-    psi = Conv2D(1, (1, 1), strides=(1, 1), padding='valid')(psi)
-    psi = Activation('sigmoid')(psi)
+    y = grouped_convolution(y, nb_channels_in, _strides=_strides)
+    y = add_common_layers(y)
     
-    return multiply([F_l, psi])
+    y = SeparableConv2D(nb_channels_out, kernel_size=(1, 1), strides=(1, 1), padding='same')(y)
+    y = bnrelu(y)
+    
+    se = squeeze_excite_block(y)
+    
+    shortcut = SeparableConv2D(nb_channels_out, kernel_size=(1, 1), strides=_strides, padding='same')(shortcut)
+    shortcut = bnrelu(shortcut)
+    
+    out = Add()([shortcut, se])
+    out = Activation('relu')(out)
+    return out
+
+def exponential_index_fetch(ms_blocks_list):
+    """Fetches outputs from previous blocks based on an exponential pattern."""
+    num_blocks = len(ms_blocks_list)
+    inputs = []
+    i = 1
+    while i <= num_blocks:
+        inputs.append(ms_blocks_list[num_blocks - i])
+        i = i * 2
+    return inputs
+
+def sparse_block(x, n_filters, num_blocks, growth_rate):
+    """A block with sparse, long-range connections."""
+    ms_blocks_list = []
+    infil = 32
+    outfil = 64
+    
+    for _ in range(num_blocks):
+        sparse_out = resnext_block(x, infil, outfil)
+        ms_blocks_list.append(sparse_out)
+        
+        fetch_outputs = exponential_index_fetch(ms_blocks_list)
+        x = concatenate(fetch_outputs, axis=-1)
+        
+    return x
+
+def upsample_concat_block(x, xskip, filters):
+    """Upsampling block for the decoder path."""
+    u = Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding="same")(x)
+    out_se = squeeze_excite_block(xskip)
+    out_con = concatenate([u, out_se])
+    return out_con
 
 # --- Model Assembly ---
 
-def build_attention_unet(input_shape, num_classes):
-    """Builds a U-Net model with attention gates."""
+def build_sparse_unet_model(input_shape, n_filters, num_blocks, growth_rate, dropout_rate, num_classes):
+    """Builds the complete Sparse U-Net model."""
     inputs = Input(input_shape)
     
     # Encoder
-    c1 = conv_block(inputs, 64)
-    p1 = MaxPooling2D((2, 2))(c1)
+    sp_block_0 = sparse_block(inputs, n_filters, num_blocks, growth_rate)
+    p0 = MaxPooling2D(pool_size=(2, 2))(sp_block_0)
     
-    c2 = conv_block(p1, 128)
-    p2 = MaxPooling2D((2, 2))(c2)
-    
-    c3 = conv_block(p2, 256)
-    p3 = MaxPooling2D((2, 2))(c3)
+    sp_block_1 = sparse_block(p0, n_filters, num_blocks, growth_rate)
+    p1 = MaxPooling2D(pool_size=(2, 2))(sp_block_1)
     
     # Bridge
-    c4 = conv_block(p3, 512)
+    bridge = sparse_block(p1, n_filters, num_blocks, growth_rate)
     
     # Decoder
-    u5 = Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(c4)
-    a5 = attention_block(u5, c3, 256)
-    c5 = concatenate([u5, a5])
-    c5 = conv_block(c5, 256)
+    u1 = upsample_concat_block(bridge, sp_block_1, n_filters)
+    d1 = sparse_block(u1, n_filters, num_blocks, growth_rate)
     
-    u6 = Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(c5)
-    a6 = attention_block(u6, c2, 128)
-    c6 = concatenate([u6, a6])
-    c6 = conv_block(c6, 128)
+    u2 = upsample_concat_block(d1, sp_block_0, n_filters)
+    d2 = sparse_block(u2, n_filters, num_blocks, growth_rate)
     
-    u7 = Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(c6)
-    a7 = attention_block(u7, c1, 64)
-    c7 = concatenate([u7, a7])
-    c7 = conv_block(c7, 64)
+    # Output
+    out = bnrelu(d2)
+    model_output = Dropout(dropout_rate)(out)
+    model_output = Conv2D(num_classes, (1, 1), padding="same", activation='softmax')(model_output)
     
-    outputs = Conv2D(num_classes, (1, 1), activation='softmax')(c7)
-    
-    model = tf.keras.Model(inputs=[inputs], outputs=[outputs])
+    model = tf.keras.Model(inputs=[inputs], outputs=[model_output])
     return model
